@@ -1,0 +1,74 @@
+name: Mirror DeepSeek Harness for Windows x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dsh-windows-x64-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      INSTALLER: dsh-latest-windows-x64.exe
+      SOURCE_URL: https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe
+
+    steps:
+      - name: Download the official installer
+        run: |
+          curl.exe --fail --location --silent --show-error --retry 3 --proto '=https' --proto-redir '=https' --output $env:INSTALLER $env:SOURCE_URL
+          if ($LASTEXITCODE -ne 0) { throw 'Installer download failed.' }
+
+      - name: Verify publisher and read the signed version
+        run: |
+          $file = Get-Item -LiteralPath $env:INSTALLER
+          $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+          if ($signature.Status -ne 'Valid') { throw "Authenticode status: $($signature.Status)" }
+          $publisher = $signature.SignerCertificate.GetNameInfo('SimpleName', $false)
+          if ($publisher -ne 'Hangzhou DeepSeek Artificial Intelligence Co., Ltd.') { throw "Unexpected publisher: $publisher" }
+          $version = $file.VersionInfo.ProductVersion
+          if ($version -notmatch '^[0-9]+[.][0-9]+[.][0-9]+(?:[.][0-9]+)?(?:[-+][0-9A-Za-z.-]+)?$') { throw "Unexpected product version: $version" }
+          $digest = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "RELEASE_TAG=dsh-$version-win-x64-$($digest.Substring(0, 12))" >> $env:GITHUB_ENV
+          "EXPECTED_DIGEST=sha256:$digest" >> $env:GITHUB_ENV
+          @("Official source: $env:SOURCE_URL", "Publisher: $publisher", "SHA-256: $digest") | Set-Content -LiteralPath release-notes.txt -Encoding utf8
+
+      - name: Publish the verified installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          $tag = $env:RELEASE_TAG
+          $title = "DeepSeek Harness $env:RELEASE_VERSION (Windows x64)"
+          $release = gh release view $tag --repo $repo --json isDraft,assets,url 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $release = $release | ConvertFrom-Json
+            $asset = $release.assets | Where-Object name -eq $env:INSTALLER
+            if ($asset -and $asset.digest -ne $env:EXPECTED_DIGEST) { throw 'Existing asset has a different or missing digest.' }
+            if (-not $release.isDraft) {
+              if (-not $asset) { throw 'Published release is missing its installer.' }
+              "Already published: $($release.url)" >> $env:GITHUB_STEP_SUMMARY
+              exit 0
+            }
+            if (-not $asset) {
+              gh release upload $tag $env:INSTALLER --repo $repo
+              if ($LASTEXITCODE -ne 0) { throw 'Uploading installer to draft failed.' }
+            }
+          } else {
+            gh release create $tag $env:INSTALLER --repo $repo --target $env:GITHUB_SHA --draft --title $title --notes-file release-notes.txt
+            if ($LASTEXITCODE -ne 0) { throw 'Creating draft release failed.' }
+          }
+          $assets = gh release view $tag --repo $repo --json assets --jq '.assets[] | [.name,.digest] | @tsv'
+          if ($LASTEXITCODE -ne 0 -or $assets -notcontains "$env:INSTALLER`t$env:EXPECTED_DIGEST") { throw 'Uploaded SHA-256 verification failed.' }
+          gh release edit $tag --repo $repo --draft=false
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing release failed.' }
+          "Download: $env:GITHUB_SERVER_URL/$repo/releases/download/$tag/$env:INSTALLER" >> $env:GITHUB_STEP_SUMMARY
